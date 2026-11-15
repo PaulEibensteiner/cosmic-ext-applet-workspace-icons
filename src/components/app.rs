@@ -1542,13 +1542,30 @@ impl IcedWorkspacesApplet {
                 };
                 // The pill width was computed from this measured size.
                 let size = text_size(window_label_text(&self.core.applet, label));
-                row![
-                    app_icon,
-                    window_label_text(&self.core.applet, label).width(size.width)
-                ]
-                .spacing(WINDOW_LABEL_SPACING)
-                .align_y(Alignment::Center)
-                .into()
+                let mut label_text = window_label_text(&self.core.applet, label).width(size.width);
+                if self.config.dim_minimized_window_icons && icon.minimized {
+                    // Fade the pill's text colour as much as the minimised icon.
+                    let pill = Self::workspace_pill_style(
+                        &theme::active(),
+                        active,
+                        urgent,
+                        hovered,
+                        pill_style,
+                        inactive_pill_style,
+                        outlined_border_width,
+                        inactive_brightness_percent,
+                    );
+                    if let Some(color) = pill.text_color {
+                        label_text = label_text.class(cosmic::theme::Text::Color(Color {
+                            a: color.a * MINIMIZED_ICON_OPACITY,
+                            ..color
+                        }));
+                    }
+                }
+                row![app_icon, label_text]
+                    .spacing(WINDOW_LABEL_SPACING)
+                    .align_y(Alignment::Center)
+                    .into()
             })
             .collect::<Vec<_>>();
         if overflow_count > 0 {
