@@ -49,7 +49,7 @@ use crate::{
     },
     wayland::WorkspaceEvent,
     wayland_subscription::{WorkspacesUpdate, workspaces},
-    window_labels::window_labels,
+    window_labels::{MAX_LABEL_CHARS, MIN_LABEL_CHARS, fit_label, window_label_parts},
 };
 
 use std::{
@@ -585,8 +585,9 @@ struct IcedWorkspacesApplet {
     core: cosmic::app::Core,
     workspaces: Vec<Workspace>,
     toplevels: Vec<ToplevelInfo>,
-    /// Label of each entry in `toplevels`, compared across all workspaces and outputs.
-    window_labels: Vec<Option<String>>,
+    /// Labels of each entry in `toplevels`, compared across all workspaces and
+    /// outputs, fitted to every length limit from `MIN_LABEL_CHARS` up.
+    window_labels: Vec<Vec<Option<String>>>,
     output: Option<WlOutput>,
     locales: Vec<String>,
     desktop_entries: Vec<fde::DesktopEntry>,
@@ -1175,7 +1176,7 @@ impl IcedWorkspacesApplet {
 
     /// returns the index of the workspace button after which which must be moved to a popup
     /// if it exists.
-    fn popup_index(&self) -> Option<usize> {
+    fn popup_index(&self, label_limit: Option<usize>) -> Option<usize> {
         let max_major_axis_len = self.core.applet.suggested_bounds.as_ref().map(|c| {
             // if we have a configure for width and height, we're in a overflow popup
             match self.core.applet.anchor {
@@ -1189,7 +1190,7 @@ impl IcedWorkspacesApplet {
             if index > 0 {
                 used += WORKSPACE_BUTTON_SPACING;
             }
-            let apps = self.apps_for_workspace(workspace);
+            let apps = self.apps_for_workspace(workspace, label_limit);
             let icons = display_icons(&apps, self.config.show_one_icon_per_application);
             used += self.workspace_button_major_size(&icons);
             if used > max_major_axis_len as f32 {
@@ -1198,6 +1199,65 @@ impl IcedWorkspacesApplet {
         }
 
         None
+    }
+
+    /// Length of the whole workspace list with labels at `label_limit` characters.
+    fn workspace_list_major_size(&self, label_limit: Option<usize>) -> f32 {
+        let buttons = self
+            .workspaces
+            .iter()
+            .map(|workspace| {
+                let apps = self.apps_for_workspace(workspace, label_limit);
+                let icons = display_icons(&apps, self.config.show_one_icon_per_application);
+                self.workspace_button_major_size(&icons)
+            })
+            .sum::<f32>();
+        WORKSPACE_LIST_EDGE_PADDING * 2.0
+            + buttons
+            + self.workspaces.len().saturating_sub(1) as f32 * WORKSPACE_BUTTON_SPACING
+    }
+
+    /// Longest label limit at which the workspace list fits the room the panel
+    /// offers, or `None` to hide the labels.
+    ///
+    /// The panel reports a width only while it is crowded, so labels shrink
+    /// below `MAX_LABEL_CHARS` but never grow beyond it.
+    fn label_limit(&self) -> Option<usize> {
+        if !self.shows_window_labels() {
+            return None;
+        }
+        let Some(available) = self
+            .core
+            .applet
+            .suggested_bounds
+            .map(|bounds| bounds.width)
+            .filter(|width| *width > 0.0)
+        else {
+            return Some(MAX_LABEL_CHARS);
+        };
+        let fits = |limit| self.workspace_list_major_size(Some(limit)) <= available;
+        if fits(MAX_LABEL_CHARS) {
+            return Some(MAX_LABEL_CHARS);
+        }
+        if !fits(MIN_LABEL_CHARS) {
+            // Without labels, hidden workspace numbers come back, which can
+            // take more room than the shortest labels.
+            let without = self.workspace_list_major_size(None);
+            let shortest = self.workspace_list_major_size(Some(MIN_LABEL_CHARS));
+            return (shortest <= without).then_some(MIN_LABEL_CHARS);
+        }
+        // Shorter limits never widen the list, so narrow the range between a
+        // limit that fits and one that does not.
+        let (mut fitting, mut too_wide) = (MIN_LABEL_CHARS, MAX_LABEL_CHARS);
+        while too_wide - fitting > 1 {
+            let middle = (fitting + too_wide) / 2;
+            if fits(middle) {
+                fitting = middle;
+            } else {
+                too_wide = middle;
+            }
+        }
+        Some(fitting)
     }
 
     fn suggested_button_size(&self) -> f32 {
@@ -1384,9 +1444,13 @@ impl IcedWorkspacesApplet {
         }
     }
 
-    fn apps_for_workspace(&self, workspace: &Workspace) -> Vec<WorkspaceApp<'_>> {
+    /// Windows on `workspace`, labelled at `label_limit` characters if set.
+    fn apps_for_workspace(
+        &self,
+        workspace: &Workspace,
+        label_limit: Option<usize>,
+    ) -> Vec<WorkspaceApp<'_>> {
         let mut apps = Vec::<WorkspaceApp<'_>>::new();
-        let shows_labels = self.shows_window_labels();
 
         for (index, toplevel) in self.toplevels.iter().enumerate() {
             if !toplevel.workspace.contains(&workspace.handle) {
@@ -1410,9 +1474,12 @@ impl IcedWorkspacesApplet {
                 minimized,
                 maximized,
                 title: &toplevel.title,
-                label: shows_labels
-                    .then(|| self.window_labels.get(index)?.as_deref())
-                    .flatten(),
+                label: label_limit.and_then(|limit| {
+                    self.window_labels
+                        .get(index)?
+                        .get(limit.checked_sub(MIN_LABEL_CHARS)?)?
+                        .as_deref()
+                }),
             };
 
             if let Some(app) = apps.iter_mut().find(|app| app.app_id == toplevel.app_id) {
@@ -3220,14 +3287,16 @@ impl cosmic::Application for IcedWorkspacesApplet {
                             .or_default()
                             .push(index);
                     }
-                    let mut labels = vec![None; self.toplevels.len()];
+                    let mut labels = vec![Vec::new(); self.toplevels.len()];
                     for indices in windows_by_app.values() {
                         let titles = indices
                             .iter()
                             .map(|&index| self.toplevels[index].title.as_str())
                             .collect::<Vec<_>>();
-                        for (&index, label) in indices.iter().zip(window_labels(&titles)) {
-                            labels[index] = label;
+                        for (&index, parts) in indices.iter().zip(window_label_parts(&titles)) {
+                            labels[index] = (MIN_LABEL_CHARS..=MAX_LABEL_CHARS)
+                                .map(|max_chars| fit_label(&parts, max_chars))
+                                .collect();
                         }
                     }
                     self.window_labels = labels;
@@ -3361,12 +3430,15 @@ impl cosmic::Application for IcedWorkspacesApplet {
             return row![].padding(8).into();
         }
         let suggested_window_size = self.core.applet.suggested_window_size();
-        let popup_index = self.popup_index().unwrap_or(self.workspaces.len());
+        let label_limit = self.label_limit();
+        let popup_index = self
+            .popup_index(label_limit)
+            .unwrap_or(self.workspaces.len());
 
         let buttons = self.workspaces[..popup_index].iter().map(|w| {
             let horizontal = self.core.applet.is_horizontal();
             let active = w.state.contains(ext_workspace_handle_v1::State::Active);
-            let apps = self.apps_for_workspace(w);
+            let apps = self.apps_for_workspace(w, label_limit);
             let icons = display_icons(&apps, self.config.show_one_icon_per_application);
             let major_size = self.workspace_button_major_size(&icons);
             let (width, height) = if horizontal {

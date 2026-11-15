@@ -6,12 +6,14 @@
 
 //! The label of a window is the part of its title that differs from the titles
 //! of the other windows of the same application. Text shared by all those
-//! titles is dropped, and the remaining parts are joined with an ellipsis, so
-//! "notes.md - nixos - VS Code" next to "docs.md - repos - VS Code" becomes
-//! "notes…nix…" and "docs…repos".
+//! titles is dropped, and the remaining parts are joined with an ellipsis. With
+//! a limit of 10 characters, "notes.md - nixos - VS Code" next to
+//! "docs.md - repos - VS Code" becomes "notes…nix…" and "docs…repos".
 
-/// Longest label in characters, joining and trailing ellipses included.
-pub const MAX_LABEL_CHARS: usize = 10;
+/// Label length limit while the panel has room, ellipses included.
+pub const MAX_LABEL_CHARS: usize = 20;
+/// Shortest limit before labels are dropped on a crowded panel.
+pub const MIN_LABEL_CHARS: usize = 3;
 /// Shorter common runs are coincidence ("o" in "notes" and "docs"), not shared text.
 const MIN_SHARED_CHARS: usize = 3;
 /// A later part cut shorter than this carries no information and is dropped.
@@ -132,15 +134,20 @@ fn distinct_parts(title: &[char], shared: &[Vec<char>]) -> Vec<String> {
         .collect()
 }
 
-/// Joins parts with ellipses within `MAX_LABEL_CHARS`, ending in "…" when cut.
-fn fit_label(parts: &[String]) -> String {
+/// Joins `parts` with ellipses within `max_chars`, ending in "…" when cut.
+///
+/// Returns `None` when there are no parts, i.e. the window gets no label.
+pub fn fit_label(parts: &[String], max_chars: usize) -> Option<String> {
+    if parts.is_empty() {
+        return None;
+    }
     let full = parts.join(ELLIPSIS);
-    if full.chars().count() <= MAX_LABEL_CHARS {
-        return full;
+    if full.chars().count() <= max_chars {
+        return Some(full);
     }
 
     // Keep one character for the trailing ellipsis.
-    let budget = MAX_LABEL_CHARS - 1;
+    let budget = max_chars.saturating_sub(1);
     let mut label = String::new();
     let mut used = 0;
     for (index, part) in parts.iter().enumerate() {
@@ -162,16 +169,17 @@ fn fit_label(parts: &[String]) -> String {
         }
     }
     label.push_str(ELLIPSIS);
-    label
+    Some(label)
 }
 
-/// Labels for the windows of one application, in the order of `titles`.
+/// Differing title parts for the windows of one application, in the order of
+/// `titles`, ready for `fit_label`.
 ///
-/// A window gets no label when it is the app's only window, when its title is
+/// A window gets no parts when it is the app's only window, when its title is
 /// empty or when nothing in its title differs from the others.
-pub fn window_labels(titles: &[&str]) -> Vec<Option<String>> {
+pub fn window_label_parts(titles: &[&str]) -> Vec<Vec<String>> {
     if titles.len() < 2 {
-        return vec![None; titles.len()];
+        return vec![Vec::new(); titles.len()];
     }
     let titles: Vec<Vec<char>> = titles
         .iter()
@@ -180,19 +188,23 @@ pub fn window_labels(titles: &[&str]) -> Vec<Option<String>> {
     let shared = shared_runs(&titles);
     titles
         .iter()
-        .map(|title| {
-            let parts = distinct_parts(title, &shared);
-            (!parts.is_empty()).then(|| fit_label(&parts))
-        })
+        .map(|title| distinct_parts(title, &shared))
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_LABEL_CHARS, fit_label, window_labels};
+    use super::{MAX_LABEL_CHARS, MIN_LABEL_CHARS, fit_label, window_label_parts};
+
+    fn labels_at(titles: &[&str], max_chars: usize) -> Vec<Option<String>> {
+        window_label_parts(titles)
+            .iter()
+            .map(|parts| fit_label(parts, max_chars))
+            .collect()
+    }
 
     fn labels(titles: &[&str]) -> Vec<Option<String>> {
-        window_labels(titles)
+        labels_at(titles, 10)
     }
 
     fn some(label: &str) -> Option<String> {
@@ -204,6 +216,29 @@ mod tests {
         assert_eq!(
             labels(&["notes.md - nixos - VS Code", "docs.md - repos - VS Code"]),
             [some("notes…nix…"), some("docs…repos")]
+        );
+    }
+
+    #[test]
+    fn longer_limits_keep_more_and_the_shortest_keeps_a_stub() {
+        let titles = ["notes.md - nixos - VS Code", "docs.md - repos - VS Code"];
+        assert_eq!(
+            labels_at(&titles, MAX_LABEL_CHARS),
+            [some("notes…nixos"), some("docs…repos")]
+        );
+        assert_eq!(
+            labels_at(&titles, MIN_LABEL_CHARS),
+            [some("no…"), some("do…")]
+        );
+        assert_eq!(
+            labels_at(
+                &[
+                    "Inbox (3) - paul@example.org - Thunderbird",
+                    "Calendar - Thunderbird"
+                ],
+                MAX_LABEL_CHARS
+            ),
+            [some("Inbox (3) - paul@ex…"), some("Calendar")]
         );
     }
 
@@ -282,7 +317,11 @@ mod tests {
             ]),
             [some("nixos"), some("repos/bre…")]
         );
-        assert_eq!(fit_label(&["abcdefgh - xyz".to_owned()]), "abcdefgh…");
+        assert_eq!(
+            fit_label(&["abcdefgh - xyz".to_owned()], 10),
+            some("abcdefgh…")
+        );
+        assert_eq!(fit_label(&[], MAX_LABEL_CHARS), None);
     }
 
     #[test]
@@ -292,8 +331,10 @@ mod tests {
             "Ganz andere Wörter hier — Ärger",
             "😀😀😀😀😀😀😀😀😀😀😀😀 — Ärger",
         ];
-        for label in labels(&titles).into_iter().flatten() {
-            assert!(label.chars().count() <= MAX_LABEL_CHARS, "{label}");
+        for max_chars in MIN_LABEL_CHARS..=MAX_LABEL_CHARS {
+            for label in labels_at(&titles, max_chars).into_iter().flatten() {
+                assert!(label.chars().count() <= max_chars, "{max_chars}: {label}");
+            }
         }
     }
 

@@ -795,17 +795,17 @@ fn shows_window_labels_only_per_window_on_horizontal_panels() {
     }
 }
 
-#[test]
-fn labels_compare_windows_of_an_app_across_workspaces_after_a_snapshot() {
+/// Applet on a top panel that received one snapshot of `windows` (app id, title)
+/// all on `workspace`, with one icon per window.
+fn snapshot_app(workspace: &Workspace, windows: &[(&str, &str)]) -> IcedWorkspacesApplet {
     use cctk::sctk::reexports::protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
     use cosmic::Application;
 
     let (client, _server) = UnixStream::pair().unwrap();
     let connection = Connection::from_socket(client).unwrap();
-    let workspace = fixture_workspace();
-    let toplevel = |app_id: &str, title: &str| ToplevelInfo {
-        title: title.into(),
-        app_id: app_id.into(),
+    let toplevel = |(app_id, title): &(&str, &str)| ToplevelInfo {
+        title: (*title).into(),
+        app_id: (*app_id).into(),
         identifier: String::new(),
         state: HashSet::new(),
         output: HashSet::new(),
@@ -819,34 +819,106 @@ fn labels_compare_windows_of_an_app_across_workspaces_after_a_snapshot() {
     let _ = app.update(Message::WorkspaceUpdate(WorkspacesUpdate::Snapshot(
         crate::wayland::WorkspaceSnapshot {
             workspaces: vec![workspace.clone()],
-            toplevels: vec![
-                toplevel("code", "notes.md - nixos - VS Code"),
-                toplevel("terminal", "paul@thinkpad: ~"),
-                toplevel("code", "docs.md - repos - VS Code"),
-            ],
+            toplevels: windows.iter().map(toplevel).collect(),
             output: None,
         },
     )));
-    assert_eq!(
-        app.window_labels,
-        [Some("notes…nix…".into()), None, Some("docs…repos".into())]
-    );
+    app
+}
 
-    let labels = |app: &IcedWorkspacesApplet| {
-        app.apps_for_workspace(&workspace)
+#[test]
+fn labels_compare_windows_of_an_app_across_workspaces_after_a_snapshot() {
+    let workspace = fixture_workspace();
+    let app = snapshot_app(
+        &workspace,
+        &[
+            ("code", "notes.md - nixos - VS Code"),
+            ("terminal", "paul@thinkpad: ~"),
+            ("code", "docs.md - repos - VS Code"),
+        ],
+    );
+    let labels = |limit| {
+        app.apps_for_workspace(&workspace, limit)
             .iter()
             .flat_map(|workspace_app| workspace_app.windows.iter().map(|window| window.label))
             .map(|label| label.map(str::to_owned))
             .collect::<Vec<_>>()
     };
+    assert_eq!(labels(None), [None, None, None]);
     assert_eq!(
-        labels(&app),
-        [None, None, None],
-        "labels are off by default"
-    );
-    app.config.show_window_labels = true;
-    assert_eq!(
-        labels(&app),
+        labels(Some(10)),
         [Some("notes…nix…".into()), Some("docs…repos".into()), None]
     );
+    assert_eq!(
+        labels(Some(MAX_LABEL_CHARS)),
+        [Some("notes…nixos".into()), Some("docs…repos".into()), None]
+    );
+    assert_eq!(labels(Some(MIN_LABEL_CHARS - 1)), [None, None, None]);
+    assert_eq!(labels(Some(MAX_LABEL_CHARS + 1)), [None, None, None]);
+}
+
+#[test]
+fn labels_shrink_only_while_the_panel_is_crowded() {
+    let workspace = fixture_workspace();
+    let mut app = snapshot_app(
+        &workspace,
+        &[
+            (
+                "code",
+                "workspace_layout_tests.rs - workspace-icons - VS Code",
+            ),
+            ("code", "default.nix - nixos - VS Code"),
+            ("code", "README.md - notes - VS Code"),
+        ],
+    );
+    let bounds = |width| Some(Size::new(width, 40.0));
+
+    assert_eq!(app.label_limit(), None, "labels are off by default");
+    app.config.show_window_labels = true;
+    app.core.applet.suggested_bounds = None;
+    assert_eq!(
+        app.label_limit(),
+        Some(MAX_LABEL_CHARS),
+        "no bounds: full length"
+    );
+    app.core.applet.suggested_bounds = bounds(10_000.0);
+    assert_eq!(
+        app.label_limit(),
+        Some(MAX_LABEL_CHARS),
+        "room: full length"
+    );
+
+    let full = app.workspace_list_major_size(Some(MAX_LABEL_CHARS));
+    let shortest = app.workspace_list_major_size(Some(MIN_LABEL_CHARS));
+    assert!(shortest < full);
+    let available = (full + shortest) / 2.0;
+    app.core.applet.suggested_bounds = bounds(available);
+    let limit = app.label_limit().unwrap();
+    assert!((MIN_LABEL_CHARS..MAX_LABEL_CHARS).contains(&limit));
+    assert!(app.workspace_list_major_size(Some(limit)) <= available);
+    assert!(
+        app.workspace_list_major_size(Some(limit + 1)) > available,
+        "the longest fitting limit is chosen"
+    );
+
+    app.core.applet.suggested_bounds = bounds(shortest);
+    assert_eq!(app.label_limit(), Some(MIN_LABEL_CHARS));
+
+    // Too crowded even for the shortest labels: they go, as that is narrower.
+    app.core.applet.suggested_bounds = bounds(shortest - 1.0);
+    assert_eq!(app.label_limit(), None);
+
+    // Hidden numbers come back without labels, so the shortest labels stay
+    // whenever they take less room than the number would.
+    app.config.hide_numbers_on_labelled_pills = true;
+    let shortest = app.workspace_list_major_size(Some(MIN_LABEL_CHARS));
+    let without = app.workspace_list_major_size(None);
+    app.core.applet.suggested_bounds = bounds(shortest.min(without) - 1.0);
+    assert_eq!(
+        app.label_limit(),
+        (shortest <= without).then_some(MIN_LABEL_CHARS)
+    );
+
+    app.layout = Layout::Column;
+    assert_eq!(app.label_limit(), None, "vertical panels have no labels");
 }

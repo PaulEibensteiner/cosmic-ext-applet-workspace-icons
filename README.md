@@ -23,7 +23,7 @@ number so you can see where windows are at a glance.
 - Choose **All filled**, **Active filled**, or **All outlined** workspace pills, and adjust their spacing, outline thickness, and inactive brightness.
 - Group windows from the same app into one icon or show an icon for each window. Set a limit of 1–16 visible icons per workspace, with `+N` for the rest.
 - Dim icons for minimised windows and highlight icons for maximised windows. Hover to see app names and window counts.
-- Label windows of the same app with the part of their title that differs, such as `notes…nix…` and `docs…repos`.
+- Label windows of the same app with the part of their title that differs, such as `notes…nixos` and `docs…repos`, shortened when the panel gets crowded.
 - Click or scroll to switch workspaces, and click the active workspace to open the overview.
 
 ## Window Labels
@@ -32,9 +32,16 @@ number so you can see where windows are at a glance.
 window whose app has several windows open, compared across all workspaces and
 monitors. Text shared by all titles of that app is left out and the parts that
 differ are joined by `…`, so `notes.md - nixos - VS Code` and
-`docs.md - repos - VS Code` become `notes…nix…` and `docs…repos`. Labels are at
-most 10 characters, ellipses included, and end in `…` when cut. Windows with
+`docs.md - repos - VS Code` become `notes…nixos` and `docs…repos`. Labels are at
+most 20 characters, ellipses included, and end in `…` when cut. Windows with
 identical titles, or whose title is only the shared text, get no label.
+
+When the panel runs out of room it gives the applet less space, and all labels
+shorten to the longest length that still fits, down to 3 characters (`no…`).
+If even that does not fit, the labels are hidden, unless the shortest labels
+take less room than the workspace numbers they replace. Labels grow back to 20
+characters when room frees up. The panel only reports the space while it is
+crowded, so labels never grow beyond 20 characters.
 
 Labels need room along the panel, so they appear only with **Show one icon per
 application** off and on horizontal panels. **Hide numbers on pills with
