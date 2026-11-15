@@ -7,6 +7,7 @@ mod config;
 mod localize;
 mod wayland;
 mod wayland_subscription;
+mod window_labels;
 
 use localize::localize;
 

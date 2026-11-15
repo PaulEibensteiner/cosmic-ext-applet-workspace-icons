@@ -34,6 +34,10 @@ pub struct WorkspacesAppletConfig {
     pub dim_minimized_window_icons: bool,
     pub highlight_maximized_window_icons: bool,
     pub show_one_icon_per_application: bool,
+    /// Label windows of an app with several windows by their title differences.
+    pub show_window_labels: bool,
+    /// Leave out the workspace number on pills that show a window label.
+    pub hide_numbers_on_labelled_pills: bool,
     pub max_visible_icons: u8,
     pub pill_style: WorkspacePillStyle,
     pub inactive_pill_style: WorkspacePillStyle,
@@ -49,6 +53,8 @@ impl Default for WorkspacesAppletConfig {
             dim_minimized_window_icons: true,
             highlight_maximized_window_icons: true,
             show_one_icon_per_application: true,
+            show_window_labels: false,
+            hide_numbers_on_labelled_pills: false,
             max_visible_icons: DEFAULT_VISIBLE_ICONS,
             pill_style: WorkspacePillStyle::Filled,
             inactive_pill_style: WorkspacePillStyle::Filled,

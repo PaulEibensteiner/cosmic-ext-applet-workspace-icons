@@ -49,6 +49,7 @@ use crate::{
     },
     wayland::WorkspaceEvent,
     wayland_subscription::{WorkspacesUpdate, workspaces},
+    window_labels::window_labels,
 };
 
 use std::{
@@ -67,6 +68,7 @@ mod workspace_layout_tests;
 
 const SCROLL_RATE_LIMIT: Duration = Duration::from_millis(200);
 const APP_ICON_SPACING: f32 = 4.0;
+const WINDOW_LABEL_SPACING: f32 = 2.0;
 const APP_GROUP_LEADING_PADDING: f32 = 4.0;
 const APP_GROUP_TRAILING_PADDING: f32 = 0.0;
 const APP_GROUP_CROSS_AXIS_PADDING: f32 = 2.0;
@@ -583,6 +585,8 @@ struct IcedWorkspacesApplet {
     core: cosmic::app::Core,
     workspaces: Vec<Workspace>,
     toplevels: Vec<ToplevelInfo>,
+    /// Label of each entry in `toplevels`, compared across all workspaces and outputs.
+    window_labels: Vec<Option<String>>,
     output: Option<WlOutput>,
     locales: Vec<String>,
     desktop_entries: Vec<fde::DesktopEntry>,
@@ -604,13 +608,16 @@ struct WorkspaceApp<'a> {
     app_id: &'a str,
     metadata: &'a AppMetadata,
     minimized_titles: Vec<&'a str>,
-    windows: Vec<WorkspaceWindowState>,
+    windows: Vec<WorkspaceWindowState<'a>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WorkspaceWindowState {
+struct WorkspaceWindowState<'a> {
     minimized: bool,
     maximized: bool,
+    title: &'a str,
+    /// Set only while window labels are shown.
+    label: Option<&'a str>,
 }
 
 #[derive(Clone, Copy)]
@@ -618,6 +625,7 @@ struct WorkspaceIcon<'a> {
     metadata: &'a AppMetadata,
     minimized: bool,
     maximized: bool,
+    label: Option<&'a str>,
 }
 
 impl WorkspaceApp<'_> {
@@ -642,7 +650,7 @@ impl WorkspaceApp<'_> {
 }
 
 fn display_icons<'a>(
-    apps: &'a [WorkspaceApp<'a>],
+    apps: &[WorkspaceApp<'a>],
     show_one_icon_per_application: bool,
 ) -> Vec<WorkspaceIcon<'a>> {
     if show_one_icon_per_application {
@@ -651,6 +659,7 @@ fn display_icons<'a>(
                 metadata: app.metadata,
                 minimized: app.all_minimized(),
                 maximized: app.has_maximized(),
+                label: None,
             })
             .collect()
     } else {
@@ -660,10 +669,34 @@ fn display_icons<'a>(
                     metadata: app.metadata,
                     minimized: window.minimized,
                     maximized: window.maximized,
+                    label: window.label,
                 })
             })
             .collect()
     }
+}
+
+/// One line per window with the app name and the full title.
+fn window_tooltip(apps: &[WorkspaceApp<'_>]) -> String {
+    apps.iter()
+        .flat_map(|app| {
+            app.windows.iter().map(|window| {
+                let name = &app.metadata.name;
+                let title = window.title.trim();
+                let line = if title.is_empty() || title.eq_ignore_ascii_case(name.trim()) {
+                    name.clone()
+                } else {
+                    format!("{name}: {title}")
+                };
+                if window.minimized {
+                    format!("{line} (minimised)")
+                } else {
+                    line
+                }
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn visible_icon_limit(value: u8) -> u8 {
@@ -861,6 +894,19 @@ fn workspace_overflow_size(applet: &cosmic::applet::Context, icon_size: f32, cou
     if count == 0 {
         return Size::ZERO;
     }
+    text_size(workspace_overflow_text(applet, icon_size, count))
+}
+
+fn window_label_text<'a>(
+    applet: &cosmic::applet::Context,
+    label: &'a str,
+) -> cosmic::widget::Text<'a, Theme> {
+    applet
+        .text(label)
+        .wrapping(cosmic::iced::core::text::Wrapping::None)
+}
+
+fn text_size(text: cosmic::widget::Text<'_, Theme>) -> Size {
     // This app uses Iced's CPU renderer. Reuse one per thread to lay out the
     // actual text widget, preserving COSMIC's font and absolute line height.
     // The widget sets its own font and size, so renderer defaults are unused.
@@ -869,7 +915,7 @@ fn workspace_overflow_size(applet: &cosmic::applet::Context, icon_size: f32, cou
             cosmic::font::default(), cosmic::iced::Pixels(16.0),
         );
     }
-    let mut text: Element<'_, Message> = workspace_overflow_text(applet, icon_size, count).into();
+    let mut text: Element<'_, Message> = text.into();
     let mut tree = Tree::new(&text);
     MEASURER.with(|renderer| {
         text.as_widget_mut()
@@ -1197,6 +1243,14 @@ impl IcedWorkspacesApplet {
         let (visible_count, overflow_count) =
             visible_icon_counts(icons.len(), self.config.max_visible_icons);
         let visible_size = self.visible_icon_slot_sizes(icons).into_iter().sum::<f32>();
+        let label_size = icons
+            .iter()
+            .take(visible_count)
+            .filter_map(|icon| icon.label)
+            .map(|label| {
+                WINDOW_LABEL_SPACING + text_size(window_label_text(&self.core.applet, label)).width
+            })
+            .sum::<f32>();
         let overflow_size = if overflow_count > 0 {
             let size =
                 workspace_overflow_size(&self.core.applet, self.app_icon_size(), overflow_count);
@@ -1209,16 +1263,30 @@ impl IcedWorkspacesApplet {
         };
 
         visible_size
+            + label_size
             + visible_count.saturating_sub(1) as f32 * APP_ICON_SPACING
             + overflow_size
-            + app_group_leading_padding(self.config.show_workspace_numbers)
+            + app_group_leading_padding(self.shows_number(icons))
             + APP_GROUP_TRAILING_PADDING
+    }
+
+    /// Labels need room along the panel, so vertical panels keep plain icons.
+    fn shows_window_labels(&self) -> bool {
+        self.config.show_window_labels
+            && !self.config.show_one_icon_per_application
+            && self.layout == Layout::Row
+    }
+
+    fn shows_number(&self, icons: &[WorkspaceIcon<'_>]) -> bool {
+        self.config.show_workspace_numbers
+            && !(self.config.hide_numbers_on_labelled_pills
+                && icons.iter().any(|icon| icon.label.is_some()))
     }
 
     fn visible_icon_slot_sizes(&self, icons: &[WorkspaceIcon<'_>]) -> Vec<f32> {
         let (visible, _) = visible_icon_counts(icons.len(), self.config.max_visible_icons);
         let icon_size = self.app_icon_size();
-        let uniform = !self.config.show_workspace_numbers
+        let uniform = !self.shows_number(icons)
             && self.config.highlight_maximized_window_icons
             && icons.iter().take(visible).any(|icon| icon.maximized);
         icons
@@ -1234,15 +1302,16 @@ impl IcedWorkspacesApplet {
     }
 
     fn workspace_button_major_size(&self, icons: &[WorkspaceIcon<'_>]) -> f32 {
+        let show_number = self.shows_number(icons);
         workspace_major_size(
-            if self.config.show_workspace_numbers {
+            if show_number {
                 self.suggested_button_size()
             } else {
                 self.workspace_cross_axis_size()
             },
             self.number_section_major_size(true),
             self.app_group_major_size(icons),
-            self.config.show_workspace_numbers,
+            show_number,
             self.workspace_content_edge_padding(icons),
         )
     }
@@ -1256,7 +1325,7 @@ impl IcedWorkspacesApplet {
             .into_iter()
             .fold(0.0_f32, f32::max);
         workspace_edge_padding(
-            self.config.show_workspace_numbers,
+            self.shows_number(icons),
             self.workspace_cross_axis_size(),
             largest_slot,
         )
@@ -1317,8 +1386,9 @@ impl IcedWorkspacesApplet {
 
     fn apps_for_workspace(&self, workspace: &Workspace) -> Vec<WorkspaceApp<'_>> {
         let mut apps = Vec::<WorkspaceApp<'_>>::new();
+        let shows_labels = self.shows_window_labels();
 
-        for toplevel in &self.toplevels {
+        for (index, toplevel) in self.toplevels.iter().enumerate() {
             if !toplevel.workspace.contains(&workspace.handle) {
                 continue;
             }
@@ -1336,12 +1406,17 @@ impl IcedWorkspacesApplet {
             let maximized = toplevel
                 .state
                 .contains(&zcosmic_toplevel_handle_v1::State::Maximized);
+            let window = WorkspaceWindowState {
+                minimized,
+                maximized,
+                title: &toplevel.title,
+                label: shows_labels
+                    .then(|| self.window_labels.get(index)?.as_deref())
+                    .flatten(),
+            };
 
             if let Some(app) = apps.iter_mut().find(|app| app.app_id == toplevel.app_id) {
-                app.windows.push(WorkspaceWindowState {
-                    minimized,
-                    maximized,
-                });
+                app.windows.push(window);
                 if minimized {
                     app.minimized_titles.push(&toplevel.title);
                 }
@@ -1353,10 +1428,7 @@ impl IcedWorkspacesApplet {
                         .then_some(toplevel.title.as_str())
                         .into_iter()
                         .collect(),
-                    windows: vec![WorkspaceWindowState {
-                        minimized,
-                        maximized,
-                    }],
+                    windows: vec![window],
                 });
             }
         }
@@ -1427,7 +1499,7 @@ impl IcedWorkspacesApplet {
     fn workspace_pill_visual<'a>(
         &'a self,
         workspace: &'a Workspace,
-        icons: &[WorkspaceIcon<'_>],
+        icons: &[WorkspaceIcon<'a>],
         width: f32,
         height: f32,
         hovered: bool,
@@ -1443,7 +1515,7 @@ impl IcedWorkspacesApplet {
         let inactive_pill_style = self.config.inactive_pill_style;
         let outlined_border_width = f32::from(self.config.pill_border_width);
         let inactive_brightness_percent = self.config.inactive_pill_brightness_percent;
-        let show_numbers = self.config.show_workspace_numbers;
+        let show_numbers = self.shows_number(icons);
         let pill_cross_axis_inset = if horizontal {
             height * f32::from(self.config.pill_spacing_percent) / 100.0
         } else {
@@ -1458,13 +1530,25 @@ impl IcedWorkspacesApplet {
             .take(visible_icon_count)
             .zip(self.visible_icon_slot_sizes(icons))
             .map(|(icon, slot_size)| {
-                self.app_icon(
+                let app_icon = self.app_icon(
                     icon.metadata,
                     icon_size,
                     self.config.dim_minimized_window_icons && icon.minimized,
                     self.config.highlight_maximized_window_icons && icon.maximized,
                     slot_size,
-                )
+                );
+                let Some(label) = icon.label else {
+                    return app_icon;
+                };
+                // The pill width was computed from this measured size.
+                let size = text_size(window_label_text(&self.core.applet, label));
+                row![
+                    app_icon,
+                    window_label_text(&self.core.applet, label).width(size.width)
+                ]
+                .spacing(WINDOW_LABEL_SPACING)
+                .align_y(Alignment::Center)
+                .into()
             })
             .collect::<Vec<_>>();
         if overflow_count > 0 {
@@ -1499,7 +1583,7 @@ impl IcedWorkspacesApplet {
             })))
             .padding(oriented_padding(
                 self.layout,
-                app_group_leading_padding(self.config.show_workspace_numbers),
+                app_group_leading_padding(show_numbers),
                 APP_GROUP_TRAILING_PADDING,
                 if show_numbers {
                     APP_GROUP_CROSS_AXIS_PADDING
@@ -1517,7 +1601,7 @@ impl IcedWorkspacesApplet {
             .last()
             .is_some_and(|last| last.handle == workspace.handle);
         let indicator = workspace_indicator(
-            self.config.show_workspace_numbers,
+            show_numbers,
             !icons.is_empty(),
             pinned,
             is_last,
@@ -1726,7 +1810,7 @@ mod tests {
         visible_icon_limit, workspace_cutout_svg, workspace_edge_padding, workspace_indicator,
         workspace_list_padding, workspace_major_size, workspace_number_font_size,
         workspace_overflow_size, workspace_overview_command, workspace_pill_radii,
-        show_empty_workspace_dot, workspace_symbol_is_cutout, workspace_tooltip,
+        show_empty_workspace_dot, window_tooltip, workspace_symbol_is_cutout, workspace_tooltip,
     };
 
     const TEST_OUTLINED_BORDER_WIDTH: f32 = 2.0;
@@ -1896,7 +1980,7 @@ mod tests {
     fn test_app<'a>(
         app_id: &'a str,
         metadata: &'a AppMetadata,
-        windows: Vec<WorkspaceWindowState>,
+        windows: Vec<WorkspaceWindowState<'a>>,
     ) -> WorkspaceApp<'a> {
         WorkspaceApp {
             app_id,
@@ -1923,15 +2007,21 @@ mod tests {
                 WorkspaceWindowState {
                     minimized: true,
                     maximized: false,
+                    title: "",
+                    label: Some("one"),
                 },
                 WorkspaceWindowState {
                     minimized: false,
                     maximized: true,
+                    title: "",
+                    label: Some("two"),
                 },
             ],
         )];
 
         let icons = display_icons(&apps, true);
+        // One icon stands for several windows, so no single label fits it.
+        assert_eq!(icons[0].label, None);
 
         assert_eq!(icons.len(), 1);
         assert!(!icons[0].minimized);
@@ -1950,10 +2040,14 @@ mod tests {
                     WorkspaceWindowState {
                         minimized: true,
                         maximized: false,
+                        title: "",
+                        label: Some("mail"),
                     },
                     WorkspaceWindowState {
                         minimized: false,
                         maximized: true,
+                        title: "",
+                        label: Some("docs"),
                     },
                 ],
             ),
@@ -1963,6 +2057,8 @@ mod tests {
                 vec![WorkspaceWindowState {
                     minimized: false,
                     maximized: false,
+                    title: "",
+                    label: None,
                 }],
             ),
         ];
@@ -1975,6 +2071,10 @@ mod tests {
         assert_eq!(icons[1].metadata.name, "Browser");
         assert_eq!((icons[1].minimized, icons[1].maximized), (false, true));
         assert_eq!(icons[2].metadata.name, "Editor");
+        assert_eq!(
+            icons.iter().map(|icon| icon.label).collect::<Vec<_>>(),
+            [Some("mail"), Some("docs"), None]
+        );
     }
 
     #[test]
@@ -2003,16 +2103,55 @@ mod tests {
                 WorkspaceWindowState {
                     minimized: false,
                     maximized: false,
+                    title: "",
+                    label: None,
                 },
                 WorkspaceWindowState {
                     minimized: false,
                     maximized: false,
+                    title: "",
+                    label: None,
                 },
             ],
         )];
 
         assert_eq!(display_icons(&apps, false).len(), 2);
         assert_eq!(workspace_tooltip(&apps), "Browser ×2");
+    }
+
+    #[test]
+    fn window_tooltip_lists_every_window_with_its_full_title() {
+        let editor = test_metadata("Visual Studio Code");
+        let terminal = test_metadata("Terminal");
+        let window = |title, minimized| WorkspaceWindowState {
+            minimized,
+            maximized: false,
+            title,
+            label: Some("cut…"),
+        };
+        let apps = [
+            test_app(
+                "code",
+                &editor,
+                vec![
+                    window(" notes.md - nixos - Visual Studio Code ", false),
+                    window("docs.md - repos - Visual Studio Code", true),
+                ],
+            ),
+            test_app(
+                "terminal",
+                &terminal,
+                vec![window("", false), window("terminal", false)],
+            ),
+        ];
+
+        assert_eq!(
+            window_tooltip(&apps),
+            "Visual Studio Code: notes.md - nixos - Visual Studio Code\n\
+             Visual Studio Code: docs.md - repos - Visual Studio Code (minimised)\n\
+             Terminal\n\
+             Terminal"
+        );
     }
 
     fn test_pill_style(
@@ -2969,6 +3108,8 @@ enum Message {
     HighlightMaximizedWindowIcons(bool),
     ShowOneIconPerApplication(bool),
     ShowWorkspaceNumbers(bool),
+    ShowWindowLabels(bool),
+    HideNumbersOnLabelledPills(bool),
     MaxVisibleIcons(u8),
     PillStyle(usize),
     PillBorderWidth(u8),
@@ -3009,6 +3150,7 @@ impl cosmic::Application for IcedWorkspacesApplet {
             core,
             workspaces: Vec::new(),
             toplevels: Vec::new(),
+            window_labels: Vec::new(),
             output: None,
             locales: fde::get_languages_from_env(),
             desktop_entries: Vec::new(),
@@ -3051,6 +3193,27 @@ impl cosmic::Application for IcedWorkspacesApplet {
                     self.toplevels = snapshot.toplevels;
                     self.output = snapshot.output;
                     self.sync_app_metadata();
+
+                    // Compare each app's windows on every workspace and output, so
+                    // windows on different pills or panels are told apart as well.
+                    let mut windows_by_app = HashMap::<&str, Vec<usize>>::new();
+                    for (index, toplevel) in self.toplevels.iter().enumerate() {
+                        windows_by_app
+                            .entry(toplevel.app_id.as_str())
+                            .or_default()
+                            .push(index);
+                    }
+                    let mut labels = vec![None; self.toplevels.len()];
+                    for indices in windows_by_app.values() {
+                        let titles = indices
+                            .iter()
+                            .map(|&index| self.toplevels[index].title.as_str())
+                            .collect::<Vec<_>>();
+                        for (&index, label) in indices.iter().zip(window_labels(&titles)) {
+                            labels[index] = label;
+                        }
+                    }
+                    self.window_labels = labels;
                 }
                 WorkspacesUpdate::Started(tx) => {
                     self.workspace_tx.replace(tx);
@@ -3130,6 +3293,14 @@ impl cosmic::Application for IcedWorkspacesApplet {
                 self.config.show_workspace_numbers = enabled;
                 self.write_config();
             }
+            Message::ShowWindowLabels(enabled) => {
+                self.config.show_window_labels = enabled;
+                self.write_config();
+            }
+            Message::HideNumbersOnLabelledPills(enabled) => {
+                self.config.hide_numbers_on_labelled_pills = enabled;
+                self.write_config();
+            }
             Message::MaxVisibleIcons(limit) => {
                 self.config.max_visible_icons = visible_icon_limit(limit);
                 self.write_config();
@@ -3201,7 +3372,11 @@ impl cosmic::Application for IcedWorkspacesApplet {
                 .class(cosmic::theme::iced::Button::Transparent);
 
             let workspace_button: Element<'_, Message> = if has_apps {
-                let tooltip = workspace_tooltip(&apps);
+                let tooltip = if self.config.show_window_labels {
+                    window_tooltip(&apps)
+                } else {
+                    workspace_tooltip(&apps)
+                };
                 self.core
                     .applet
                     .applet_tooltip(btn, tooltip, false, Message::Surface, None)
@@ -3336,6 +3511,20 @@ impl cosmic::Application for IcedWorkspacesApplet {
                 toggler(self.config.show_workspace_numbers)
                     .on_toggle(Message::ShowWorkspaceNumbers)
                     .label(crate::fl!("show-workspace-numbers"))
+                    .text_size(14)
+                    .width(Length::Fill)
+            ),
+            padded_control(
+                toggler(self.config.show_window_labels)
+                    .on_toggle(Message::ShowWindowLabels)
+                    .label(crate::fl!("show-window-labels"))
+                    .text_size(14)
+                    .width(Length::Fill)
+            ),
+            padded_control(
+                toggler(self.config.hide_numbers_on_labelled_pills)
+                    .on_toggle(Message::HideNumbersOnLabelledPills)
+                    .label(crate::fl!("hide-numbers-on-labelled-pills"))
                     .text_size(14)
                     .width(Length::Fill)
             ),

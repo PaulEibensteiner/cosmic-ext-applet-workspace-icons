@@ -23,7 +23,24 @@ number so you can see where windows are at a glance.
 - Choose **All filled**, **Active filled**, or **All outlined** workspace pills, and adjust their spacing, outline thickness, and inactive brightness.
 - Group windows from the same app into one icon or show an icon for each window. Set a limit of 1–16 visible icons per workspace, with `+N` for the rest.
 - Dim icons for minimised windows and highlight icons for maximised windows. Hover to see app names and window counts.
+- Label windows of the same app with the part of their title that differs, such as `notes…nix…` and `docs…repos`.
 - Click or scroll to switch workspaces, and click the active workspace to open the overview.
+
+## Window Labels
+
+**Label windows of the same app** puts a short label next to the icon of each
+window whose app has several windows open, compared across all workspaces and
+monitors. Text shared by all titles of that app is left out and the parts that
+differ are joined by `…`, so `notes.md - nixos - VS Code` and
+`docs.md - repos - VS Code` become `notes…nix…` and `docs…repos`. Labels are at
+most 10 characters, ellipses included, and end in `…` when cut. Windows with
+identical titles, or whose title is only the shared text, get no label.
+
+Labels need room along the panel, so they appear only with **Show one icon per
+application** off and on horizontal panels. **Hide numbers on pills with
+labels** leaves out the workspace number on pills that show a label, to keep
+them narrow. While labels are enabled, the tooltip lists every window as
+`App name: full window title`.
 
 ## Workspace Numbers
 

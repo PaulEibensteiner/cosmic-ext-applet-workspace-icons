@@ -19,6 +19,7 @@ fn fixture_app(layout: Layout, panel_size: PanelSize, cross: f32) -> IcedWorkspa
         core,
         workspaces: Vec::new(),
         toplevels: Vec::new(),
+        window_labels: Vec::new(),
         output: None,
         locales: Vec::new(),
         desktop_entries: Vec::new(),
@@ -126,7 +127,7 @@ fn probe(
         .unwrap()
         .bounds();
     let content = stack.children().nth(1).unwrap().children().next().unwrap();
-    let app_group = if app.config.show_workspace_numbers {
+    let app_group = if app.shows_number(icons) {
         content.children().nth(2).unwrap()
     } else {
         content
@@ -187,6 +188,7 @@ fn calculated_button_size_matches_actual_overflow_layout() {
                                 metadata: &metadata,
                                 minimized: false,
                                 maximized: highlighted[index.min(2)],
+                                label: None,
                             })
                             .collect();
                         for spacing in [0, 10] {
@@ -321,6 +323,7 @@ fn highlights_beyond_the_visible_limit_do_not_change_visible_slots() {
                     metadata: &metadata,
                     minimized: false,
                     maximized: false,
+                    label: None,
                 })
                 .collect();
             let before = probe(&app, &workspace, &icons, false, &renderer);
@@ -328,6 +331,7 @@ fn highlights_beyond_the_visible_limit_do_not_change_visible_slots() {
                 metadata: &metadata,
                 minimized: false,
                 maximized: true,
+                label: None,
             });
             let after = probe(&app, &workspace, &icons, false, &renderer);
             assert_eq!(before.frames.len(), after.frames.len());
@@ -408,6 +412,7 @@ fn overflow_grows_by_its_natural_text_extent_without_changing_end_padding() {
                             metadata: &metadata,
                             minimized: false,
                             maximized: *maximized,
+                            label: None,
                         })
                         .collect();
                     let before = probe(&app, &workspace, &icons, false, &renderer);
@@ -573,6 +578,7 @@ fn render_layout_samples_and_asset_bounds() {
                             metadata: &metadata,
                             minimized: false,
                             maximized: i == if variant == 0 { 0 } else { 2 },
+                            label: None,
                         })
                         .collect();
                     let hovered = variant == 2;
@@ -702,5 +708,145 @@ fn render_layout_samples_and_asset_bounds() {
     println!(
         "Visual samples and measurements written to {}",
         output.display()
+    );
+}
+
+#[test]
+fn window_labels_follow_their_icon_and_can_replace_the_number() {
+    let metadata = AppMetadata {
+        name: "controlled".into(),
+        icon_source: fde::IconSource::default(),
+    };
+    let workspace = fixture_workspace();
+    let renderer = renderer();
+    let icon = |label| WorkspaceIcon {
+        metadata: &metadata,
+        minimized: false,
+        maximized: false,
+        label,
+    };
+    let plain = [icon(None), icon(None)];
+    let labelled = [icon(Some("notes…nix…")), icon(None)];
+    for (preset, cross) in [
+        (PanelSize::XS, 32.0),
+        (PanelSize::S, 40.0),
+        (PanelSize::M, 56.0),
+    ] {
+        let mut app = fixture_app(Layout::Row, preset, cross);
+        let label_width = text_size(window_label_text(&app.core.applet, "notes…nix…")).width;
+        assert!(label_width > 0.0);
+        for numbers in [false, true] {
+            for hide in [false, true] {
+                app.config.show_workspace_numbers = numbers;
+                app.config.hide_numbers_on_labelled_pills = hide;
+                assert_eq!(app.shows_number(&plain), numbers);
+                assert_eq!(app.shows_number(&labelled), numbers && !hide);
+
+                let p = probe(&app, &workspace, &labelled, false, &renderer);
+                let context = format!("panel height {cross}, numbers={numbers}, hide={hide}");
+                assert_near(
+                    major(p.app_group, Layout::Row),
+                    app.app_group_major_size(&labelled),
+                    &format!("laid-out group matches the planned size: {context}"),
+                );
+                assert_near(
+                    major(p.items[0], Layout::Row),
+                    app.app_icon_size() + WINDOW_LABEL_SPACING + label_width,
+                    &format!("label sits right after its icon: {context}"),
+                );
+                assert_near(
+                    major(p.items[1], Layout::Row),
+                    app.app_icon_size(),
+                    &format!("unlabelled icon keeps its slot: {context}"),
+                );
+                if app.shows_number(&labelled) == app.shows_number(&plain) {
+                    assert_near(
+                        app.app_group_major_size(&labelled) - app.app_group_major_size(&plain),
+                        WINDOW_LABEL_SPACING + label_width,
+                        &format!("label adds its own width only: {context}"),
+                    );
+                } else {
+                    let hidden = app.workspace_button_major_size(&labelled);
+                    app.config.hide_numbers_on_labelled_pills = false;
+                    let shown = app.workspace_button_major_size(&labelled);
+                    app.config.hide_numbers_on_labelled_pills = hide;
+                    assert!(
+                        hidden < shown,
+                        "hiding the number narrows the pill: {context}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn shows_window_labels_only_per_window_on_horizontal_panels() {
+    for (layout, one_icon_per_app, enabled, expected) in [
+        (Layout::Row, false, true, true),
+        (Layout::Row, false, false, false),
+        (Layout::Row, true, true, false),
+        (Layout::Column, false, true, false),
+    ] {
+        let mut app = fixture_app(layout, PanelSize::S, 40.0);
+        app.config.show_one_icon_per_application = one_icon_per_app;
+        app.config.show_window_labels = enabled;
+        assert_eq!(app.shows_window_labels(), expected);
+    }
+}
+
+#[test]
+fn labels_compare_windows_of_an_app_across_workspaces_after_a_snapshot() {
+    use cctk::sctk::reexports::protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
+    use cosmic::Application;
+
+    let (client, _server) = UnixStream::pair().unwrap();
+    let connection = Connection::from_socket(client).unwrap();
+    let workspace = fixture_workspace();
+    let toplevel = |app_id: &str, title: &str| ToplevelInfo {
+        title: title.into(),
+        app_id: app_id.into(),
+        identifier: String::new(),
+        state: HashSet::new(),
+        output: HashSet::new(),
+        geometry: HashMap::new(),
+        workspace: HashSet::from([workspace.handle.clone()]),
+        cosmic_toplevel: None,
+        foreign_toplevel: ExtForeignToplevelHandleV1::inert(connection.backend().downgrade()),
+    };
+    let mut app = fixture_app(Layout::Row, PanelSize::S, 40.0);
+    app.config.show_one_icon_per_application = false;
+    let _ = app.update(Message::WorkspaceUpdate(WorkspacesUpdate::Snapshot(
+        crate::wayland::WorkspaceSnapshot {
+            workspaces: vec![workspace.clone()],
+            toplevels: vec![
+                toplevel("code", "notes.md - nixos - VS Code"),
+                toplevel("terminal", "paul@thinkpad: ~"),
+                toplevel("code", "docs.md - repos - VS Code"),
+            ],
+            output: None,
+        },
+    )));
+    assert_eq!(
+        app.window_labels,
+        [Some("notes…nix…".into()), None, Some("docs…repos".into())]
+    );
+
+    let labels = |app: &IcedWorkspacesApplet| {
+        app.apps_for_workspace(&workspace)
+            .iter()
+            .flat_map(|workspace_app| workspace_app.windows.iter().map(|window| window.label))
+            .map(|label| label.map(str::to_owned))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        labels(&app),
+        [None, None, None],
+        "labels are off by default"
+    );
+    app.config.show_window_labels = true;
+    assert_eq!(
+        labels(&app),
+        [Some("notes…nix…".into()), Some("docs…repos".into()), None]
     );
 }
